@@ -1,13 +1,27 @@
 import { useState } from "react";
-import { useWriteContract, usePublicClient } from "wagmi";
+import { useAccount, useReadContract, useWriteContract, usePublicClient } from "wagmi";
 import * as XLSX from "xlsx";
-import { isAddress, zeroAddress } from "viem";
+import { isAddress, keccak256, toBytes } from "viem";
 import { ABI, CONTRACT_ADDRESS } from "./wagmi";
 
+const MINTER_ROLE = keccak256(toBytes("MINTER_ROLE"));
 const REQUIRED = ["studentName", "studentId", "diplomaTitle", "issueDate", "grade"];
 const BATCH_SIZE = 10;
 
-// Validation côté client AVANT d'envoyer une transaction (coûte du gas sinon)
+// Métadonnées ERC-721 encodées dans une data-URI (pas besoin d'IPFS en local)
+function buildUri(r) {
+  const meta = {
+    name: `${r.diplomaTitle} - ${r.studentName}`,
+    description: "Certificat académique",
+    attributes: [
+      { trait_type: "studentId", value: r.studentId },
+      { trait_type: "issueDate", value: r.issueDate },
+      { trait_type: "grade", value: r.grade },
+    ],
+  };
+  return "data:application/json;base64," + btoa(unescape(encodeURIComponent(JSON.stringify(meta))));
+}
+
 function validateRow(r) {
   const errors = [];
   REQUIRED.forEach((k) => { if (!r[k]) errors.push(`${k} manquant`); });
@@ -16,13 +30,26 @@ function validateRow(r) {
   return errors;
 }
 
+function friendly(err) {
+  const m = err.shortMessage || err.message || "";
+  if (m.includes("AccessControlUnauthorizedAccount")) return "Ce compte n'a pas le rôle MINTER_ROLE.";
+  if (m.includes("Already issued")) return "Un certificat existe déjà pour ce studentId.";
+  if (m.includes("User rejected")) return "Transaction refusée dans le wallet.";
+  return m;
+}
+
 export default function Admin() {
+  const { address } = useAccount();
   const { writeContractAsync } = useWriteContract();
   const publicClient = usePublicClient();
   const [log, setLog] = useState([]);
   const addLog = (m) => setLog((l) => [...l, m]);
 
-  // ---------- Mint unitaire ----------
+  const { data: isMinter } = useReadContract({
+    address: CONTRACT_ADDRESS, abi: ABI, functionName: "hasRole",
+    args: [MINTER_ROLE, address], query: { enabled: !!address },
+  });
+
   const [form, setForm] = useState({ recipientAddress: "", studentName: "", studentId: "",
                                      diplomaTitle: "", issueDate: "", grade: "" });
 
@@ -33,17 +60,16 @@ export default function Admin() {
     try {
       const hash = await writeContractAsync({
         address: CONTRACT_ADDRESS, abi: ABI, functionName: "mintCertificate",
-        args: [form.recipientAddress || zeroAddress, form.studentName, form.studentId,
-               form.diplomaTitle, form.issueDate, form.grade],
+        args: [form.recipientAddress || address, form.studentName, form.studentId,
+               form.diplomaTitle, form.issueDate, form.grade, buildUri(form)],
       });
       addLog("Tx envoyée : " + hash);
       await publicClient.waitForTransactionReceipt({ hash });
       addLog("✅ Confirmée : " + hash);
-    } catch (err) { addLog("❌ " + (err.shortMessage || err.message)); }
+    } catch (err) { addLog("❌ " + friendly(err)); }
   }
 
-  // ---------- Import Excel ----------
-  const [rows, setRows] = useState([]);   // [{...données, errors, selected}]
+  const [rows, setRows] = useState([]);
 
   async function onFile(e) {
     const file = e.target.files[0];
@@ -62,30 +88,35 @@ export default function Admin() {
     const todo = rows.filter((r) => r.selected);
     for (let i = 0; i < todo.length; i += BATCH_SIZE) {
       const chunk = todo.slice(i, i + BATCH_SIZE);
+      const n = i / BATCH_SIZE + 1;
       try {
         const hash = await writeContractAsync({
-          address: CONTRACT_ADDRESS, abi: ABI, functionName: "batchMint",
+          address: CONTRACT_ADDRESS, abi: ABI, functionName: "batchMintCertificates",
           args: [
-            chunk.map((r) => r.recipientAddress || zeroAddress),
+            chunk.map((r) => r.recipientAddress || address),
+            chunk.map(buildUri),
             chunk.map((r) => r.studentName), chunk.map((r) => r.studentId),
             chunk.map((r) => r.diplomaTitle), chunk.map((r) => r.issueDate),
             chunk.map((r) => r.grade),
           ],
         });
-        addLog(`Lot ${i / BATCH_SIZE + 1} envoyé : ${hash}`);
+        addLog(`Lot ${n} envoyé : ${hash}`);
         await publicClient.waitForTransactionReceipt({ hash });
-        addLog(`✅ Lot ${i / BATCH_SIZE + 1} confirmé`);
-      } catch (err) { addLog(`❌ Lot ${i / BATCH_SIZE + 1} : ` + (err.shortMessage || err.message)); }
+        addLog(`✅ Lot ${n} confirmé`);
+      } catch (err) { addLog(`❌ Lot ${n} : ` + friendly(err)); }
     }
   }
 
   return (
     <section>
+      {address && isMinter === false && (
+        <p style={{ color: "red" }}>⚠️ Ce compte n'a pas le rôle MINTER_ROLE : les émissions seront refusées.</p>
+      )}
       <h2>Mint unitaire</h2>
       <form onSubmit={mintOne} style={{ display: "grid", gap: 6 }}>
         {Object.keys(form).map((k) => (
-          <input key={k} placeholder={k} value={form[k]}
-                 onChange={(e) => setForm({ ...form, [k]: e.target.value })} />
+          <input key={k} placeholder={k === "recipientAddress" ? "recipientAddress (vide = votre wallet)" : k}
+                 value={form[k]} onChange={(e) => setForm({ ...form, [k]: e.target.value })} />
         ))}
         <button type="submit">Émettre</button>
       </form>
